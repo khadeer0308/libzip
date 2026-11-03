@@ -1,4 +1,5 @@
 set(FUZZ_PROGRAMS
+  zip_modify_fuzzer
   zip_read_file_fuzzer
   zip_read_fuzzer
   zip_read_metadata_fuzzer

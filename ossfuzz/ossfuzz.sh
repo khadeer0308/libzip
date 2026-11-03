@@ -37,6 +37,16 @@ find $SRC/libzip/regress -name "*zip" | \
      xargs zip $OUT/zip_read_fuzzer_seed_corpus.zip
 cp $SRC/libzip/ossfuzz/zip_read_fuzzer.dict $OUT/
 
+# zip_modify_fuzzer expects an archive followed by a control block whose
+# length is given by the last byte; append a random 128-byte control block.
+mkdir -p modify_seeds
+for zip in $(find $SRC/libzip/regress -name "*zip")
+do
+  { cat "$zip"; head -c 128 /dev/urandom; printf '\x80'; } > modify_seeds/$(basename "$zip")
+done
+(cd modify_seeds && zip -q $OUT/zip_modify_fuzzer_seed_corpus.zip *)
+cp $SRC/libzip/ossfuzz/zip_read_fuzzer.dict $OUT/zip_modify_fuzzer.dict
+
 cp $SRC/libzip/ossfuzz/zip_write_encrypt_aes256_file_fuzzer_seed_corpus.zip $OUT/
 
 for pair in \
