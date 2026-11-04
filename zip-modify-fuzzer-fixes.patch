@@ -1,0 +1,310 @@
+diff --git a/ossfuzz/zip_modify_fuzzer.c b/ossfuzz/zip_modify_fuzzer.c
+index e7b3368..1023a40 100644
+--- a/ossfuzz/zip_modify_fuzzer.c
++++ b/ossfuzz/zip_modify_fuzzer.c
+@@ -31,17 +31,38 @@
+     before it; everything in front of the control block is the archive.
+     The control bytes select open flags and a sequence of modification
+     operations.  After zip_close() the rewritten archive is reopened with
+-    ZIP_CHECKCONS and every entry is read back.
++    ZIP_CHECKCONS and its entries are read back, subject to the limits
++    below (MAX_READ_SIZE and MAX_OPEN_ATTEMPTS).
+ */
+ 
+-#include <stdint.h>
+ #include <stddef.h>
++#include <stdint.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <zip.h>
+ 
+ #define MAX_OPS 32
+ #define MAX_COPY_LENGTH 65536
++/* Entries larger than this (compressed or uncompressed) are not copied or
++   recompressed, so a small input cannot expand into a huge output. */
++#define MAX_ENTRY_SIZE (1024 * 1024)
++/* Upper bound on the data added by copy operations plus the data
++   recompressed by recompression operations of one input. */
++#define MAX_TOTAL_CHANGE_SIZE (4 * 1024 * 1024)
++/* XZ is always used with LZMA_PRESET_EXTREME, which is slow and needs a
++   lot of memory at higher presets; keep it low to avoid timeouts. */
++#define MAX_XZ_LEVEL 3
++/* Upper bound on the decompressed data read back from the rewritten
++   archive, across all entries. */
++#define MAX_READ_SIZE (8 * 1024 * 1024)
++/* Upper bound on zip_fopen_index() attempts in read_all(); failed opens
++   and empty entries consume no read budget but still cost work (e.g. the
++   WinZip AES key derivation). */
++#define MAX_OPEN_ATTEMPTS 1024
++/* Upper bound on the summed compressed size of all entries zip_close() would
++   write.  Central directory entries may all point to the same data, and
++   zip_close() copies the data once per entry. */
++#define MAX_OUTPUT_DATA_SIZE (8 * 1024 * 1024)
+ 
+ typedef struct {
+     const uint8_t *p;
+@@ -49,20 +70,17 @@ typedef struct {
+     size_t pos;
+ } stream_t;
+ 
+-static uint8_t
+-u8(stream_t *s) {
++static uint8_t u8(stream_t *s) {
+     return s->pos < s->len ? s->p[s->pos++] : 0;
+ }
+ 
+-static uint16_t
+-u16(stream_t *s) {
++static uint16_t u16(stream_t *s) {
+     uint16_t v = u8(s);
+     v = (uint16_t)(v | ((uint16_t)u8(s) << 8));
+     return v;
+ }
+ 
+-static uint32_t
+-u32(stream_t *s) {
++static uint32_t u32(stream_t *s) {
+     uint32_t v = u16(s);
+     v |= (uint32_t)u16(s) << 16;
+     return v;
+@@ -70,31 +88,112 @@ u32(stream_t *s) {
+ 
+ static const char *PASSWORD = "secretpassword";
+ 
+-static void
+-read_all(zip_t *za) {
++static void read_all(zip_t *za) {
+     zip_int64_t n, i;
++    zip_uint64_t total = 0;
++    int attempts = 0;
+     char buf[8192];
+ 
+     n = zip_get_num_entries(za, 0);
+-    for (i = 0; i < n; i++) {
++    for (i = 0; i < n && total < MAX_READ_SIZE && attempts < MAX_OPEN_ATTEMPTS; i++) {
+         zip_stat_t st;
+         zip_file_t *f;
+ 
+         zip_stat_init(&st);
+         (void)zip_stat_index(za, (zip_uint64_t)i, 0, &st);
+ 
++        attempts++;
+         if ((f = zip_fopen_index(za, (zip_uint64_t)i, 0)) == NULL) {
+             continue;
+         }
+-        while (zip_fread(f, buf, sizeof(buf)) > 0) {
+-            ;
++        while (total < MAX_READ_SIZE) {
++            zip_uint64_t want = MAX_READ_SIZE - total;
++            zip_int64_t got;
++
++            if (want > sizeof(buf)) {
++                want = sizeof(buf);
++            }
++            /* < 0 is a read error, 0 is end of file; stop either way. */
++            if ((got = zip_fread(f, buf, want)) <= 0) {
++                break;
++            }
++            total += (zip_uint64_t)got;
+         }
+-        zip_fclose(f);
++        /* Always close, also after an error or a partial read; the result
++           only reports errors already seen by zip_fread(). */
++        (void)zip_fclose(f);
+     }
+ }
+ 
+-static zip_t *
+-open_buffer(const uint8_t *data, size_t size, int flags, zip_source_t **srcp) {
++/* Return 1 if entry idx of za has a known size of at most MAX_ENTRY_SIZE,
++   storing the larger of its compressed and uncompressed size in *sizep. */
++static int entry_within_limit(zip_t *za, zip_uint64_t idx, zip_uint64_t *sizep) {
++    zip_stat_t st;
++    zip_uint64_t size;
++
++    zip_stat_init(&st);
++    if (zip_stat_index(za, idx, 0, &st) < 0) {
++        return 0;
++    }
++    if ((st.valid & ZIP_STAT_SIZE) == 0 || st.size > MAX_ENTRY_SIZE) {
++        return 0;
++    }
++    size = st.size;
++    if (st.valid & ZIP_STAT_COMP_SIZE) {
++        if (st.comp_size > MAX_ENTRY_SIZE) {
++            return 0;
++        }
++        if (st.comp_size > size) {
++            size = st.comp_size;
++        }
++    }
++    if (sizep) {
++        *sizep = size;
++    }
++    return 1;
++}
++
++/* Return 1 if the entry data zip_close() would write exceeds
++   MAX_OUTPUT_DATA_SIZE or cannot be determined.  Entries that cannot be
++   stat'ed are skipped: deleted entries (original ones fail with
++   ZIP_ER_DELETED, added-then-deleted ones with ZIP_ER_INVAL) are not
++   written, and for any other entry zip_close() fails on its own.  Entries
++   with recompression pending or new data are bounded separately by
++   MAX_TOTAL_CHANGE_SIZE. */
++static int output_too_large(zip_t *za) {
++    zip_int64_t n, i;
++    zip_uint64_t total = 0;
++
++    if ((n = zip_get_num_entries(za, 0)) < 0) {
++        return 1;
++    }
++    for (i = 0; i < n; i++) {
++        zip_stat_t st;
++        zip_uint64_t size;
++
++        zip_stat_init(&st);
++        if (zip_stat_index(za, (zip_uint64_t)i, 0, &st) < 0) {
++            zip_error_clear(za);
++            continue;
++        }
++        if (st.valid & ZIP_STAT_COMP_SIZE) {
++            size = st.comp_size;
++        }
++        else if (st.valid & ZIP_STAT_SIZE) {
++            size = st.size;
++        }
++        else {
++            return 1;
++        }
++        if (size > MAX_OUTPUT_DATA_SIZE - total) {
++            return 1;
++        }
++        total += size;
++    }
++    return 0;
++}
++
++static zip_t *open_buffer(const uint8_t *data, size_t size, int flags, zip_source_t **srcp) {
+     zip_error_t error;
+     zip_source_t *src;
+     zip_t *za;
+@@ -120,8 +219,7 @@ open_buffer(const uint8_t *data, size_t size, int flags, zip_source_t **srcp) {
+ extern "C" {
+ #endif
+ 
+-int
+-LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
++int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+     static const zip_int32_t methods[] = {ZIP_CM_DEFAULT, ZIP_CM_STORE, ZIP_CM_DEFLATE, ZIP_CM_BZIP2, ZIP_CM_XZ, ZIP_CM_ZSTD};
+     static const zip_uint16_t encryptions[] = {ZIP_EM_NONE, ZIP_EM_TRAD_PKWARE, ZIP_EM_AES_128, ZIP_EM_AES_256};
+     stream_t ctl;
+@@ -129,6 +227,7 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+     zip_source_t *src = NULL;
+     zip_t *za, *other;
+     zip_int64_t n;
++    zip_uint64_t changed = 0; /* charged against MAX_TOTAL_CHANGE_SIZE */
+     int open_flags, nops, i;
+     uint8_t mode;
+ 
+@@ -172,7 +271,17 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+         switch (op) {
+         case 0: /* recompress an existing entry */
+             if (n > 0) {
+-                zip_set_file_compression(za, idx, methods[u8(&ctl) % (sizeof(methods) / sizeof(methods[0]))], u8(&ctl) % 10);
++                zip_int32_t method = methods[u8(&ctl) % (sizeof(methods) / sizeof(methods[0]))];
++                zip_uint32_t level = u8(&ctl) % 10;
++                zip_uint64_t esize;
++                if (method == ZIP_CM_XZ && level > MAX_XZ_LEVEL) {
++                    level = MAX_XZ_LEVEL;
++                }
++                if (entry_within_limit(za, idx, &esize) && esize <= MAX_TOTAL_CHANGE_SIZE - changed) {
++                    if (zip_set_file_compression(za, idx, method, level) == 0) {
++                        changed += esize;
++                    }
++                }
+             }
+             break;
+ 
+@@ -202,13 +311,17 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+ 
+         case 4:
+             if (n > 0) {
+-                zip_file_set_dostime(za, idx, u16(&ctl), u16(&ctl), 0);
++                zip_uint16_t dtime = u16(&ctl);
++                zip_uint16_t ddate = u16(&ctl);
++                zip_file_set_dostime(za, idx, dtime, ddate, 0);
+             }
+             break;
+ 
+         case 5:
+             if (n > 0) {
+-                zip_file_set_external_attributes(za, idx, 0, u8(&ctl), u32(&ctl));
++                zip_uint8_t opsys = u8(&ctl);
++                zip_uint32_t attributes = u32(&ctl);
++                zip_file_set_external_attributes(za, idx, 0, opsys, attributes);
+             }
+             break;
+ 
+@@ -245,7 +358,7 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+         case 8: /* copy an entry (or part of it) from the other archive */
+         case 9: {
+             zip_int64_t on;
+-            zip_uint64_t oidx, start = 0;
++            zip_uint64_t oidx, start = 0, esize;
+             zip_int64_t len = -1;
+             zip_flags_t flags = 0;
+             zip_source_t *zs;
+@@ -264,6 +377,21 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+                 start = u16(&ctl);
+                 len = (zip_int64_t)(u16(&ctl) % MAX_COPY_LENGTH);
+             }
++            if (len >= 0) {
++                /* Partial copy: at most start + len bytes are decompressed
++                   and len bytes are added, whatever the entry's full size.
++                   Range checks against the entry are left to libzip. */
++                if (start > MAX_ENTRY_SIZE || (zip_uint64_t)len > MAX_ENTRY_SIZE - start) {
++                    break;
++                }
++                esize = (zip_uint64_t)len;
++            }
++            else if (!entry_within_limit(other, oidx, &esize)) {
++                break;
++            }
++            if (esize > MAX_TOTAL_CHANGE_SIZE - changed) {
++                break;
++            }
+             if ((zs = zip_source_zip_file(za, other, oidx, flags, start, len, (f & 4) ? PASSWORD : NULL)) == NULL) {
+                 break;
+             }
+@@ -271,6 +399,9 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+                 if (zip_file_replace(za, idx, zs, 0) < 0) {
+                     zip_source_free(zs);
+                 }
++                else {
++                    changed += esize;
++                }
+             }
+             else {
+                 memcpy(name, "copy-", 5);
+@@ -280,6 +411,9 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+                 if (zip_file_add(za, name, zs, ZIP_FL_OVERWRITE) < 0) {
+                     zip_source_free(zs);
+                 }
++                else {
++                    changed += esize;
++                }
+             }
+             break;
+         }
+@@ -301,8 +435,9 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+         }
+     }
+ 
+-    /* Serialize the modified archive back into the buffer source. */
+-    if (zip_close(za) < 0) {
++    /* Serialize the modified archive back into the buffer source, unless
++       that would write too much data; zip_close() is then not called. */
++    if (output_too_large(za) || zip_close(za) < 0) {
+         zip_discard(za);
+         if (other) {
+             zip_discard(other);
